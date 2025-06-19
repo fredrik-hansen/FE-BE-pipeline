@@ -1,0 +1,426 @@
+
+stages:
+  - install
+  - lint
+  - security
+  - test
+  - coverage
+  - build
+  - scan
+  - deploy
+  - release
+  - dependency_updates
+
+variables:
+  DOCKER_BACKEND_IMAGE: "$CI_REGISTRY_IMAGE/backend"
+  DOCKER_FRONTEND_IMAGE: "$CI_REGISTRY_IMAGE/frontend"
+  DOCKER_BUILDKIT: 1
+
+cache:
+  paths:
+    - backend/.venv/
+    - backend/.mypy_cache/
+    - backend/.pytest_cache/
+    - frontend/node_modules/
+    - frontend/coverage/
+    - backend/htmlcov/
+
+##############################
+# 1. Install Dependencies    #
+##############################
+install_backend:
+  image: python:3.11
+  stage: install
+  script:
+    - pip install --upgrade pip
+    - cd backend
+    - pip install -r requirements.txt
+  artifacts:
+    paths:
+      - backend/.venv/
+    expire_in: 1h
+
+install_frontend:
+  image: node:23-alpine
+  stage: install
+  script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+  artifacts:
+    paths:
+      - frontend/node_modules/
+    expire_in: 1h
+
+##############################
+# 2. Linting                 #
+##############################
+lint_backend:
+  image: python:3.11
+  stage: lint
+  before_script:
+    - pip install --upgrade pip
+    - cd backend
+    - pip install -r requirements.txt
+  script:
+    - pip install flake8
+    - flake8 . --exit-zero --format=html --htmldir=flake8-report || true
+  allow_failure: true
+  artifacts:
+    paths:
+      - backend/flake8-report/
+    expire_in: 30m
+
+lint_frontend:
+  image: node:23-alpine
+  stage: lint
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+  script:
+    - npx eslint . --ext .ts,.tsx --output-file eslint-report.txt || true
+  allow_failure: true
+  artifacts:
+    paths:
+      - frontend/eslint-report.txt
+    expire_in: 30m
+
+##############################
+# 3. Security                #
+##############################
+security_backend:
+  image: python:3.11
+  stage: security
+  before_script:
+    - pip install --upgrade pip
+    - cd backend
+    - pip install -r requirements.txt
+    - pip install bandit
+  script:
+    - bandit -r . -f html -o bandit-report.html || true
+  allow_failure: true
+  artifacts:
+    paths:
+      - backend/bandit-report.html
+    expire_in: 30m
+
+security_frontend:
+  image: node:23-alpine
+  stage: security
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+  script:
+    - npx audit-ci --moderate --report-type=summary || npm audit --audit-level=moderate || true
+  allow_failure: true
+
+##############################
+# 4. Automated Tests         #
+##############################
+test_backend:
+  image: python:3.11
+  allow_failure: true
+  stage: test
+  before_script:
+    - pip install --upgrade pip
+    - cd backend
+    - pip install -r requirements.txt
+    - pip install pytest pytest-cov
+  script:
+    - pytest --cov=. --cov-report html --cov-report xml
+  artifacts:
+    paths:
+      - backend/htmlcov/
+      - backend/coverage.xml
+    reports:
+      junit: backend/junit.xml
+    expire_in: 1h
+
+test_frontend:
+  image: node:23-alpine
+  allow_failure: true
+  stage: test
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    
+    - npm ci
+  script:
+    - npx vitest run --coverage || npx jest --coverage
+  artifacts:
+    paths:
+      - frontend/coverage/
+    expire_in: 1h
+
+##############################
+# 5. Coverage                #
+##############################
+coverage_backend:
+  image: python:3.11
+  allow_failure: true
+  stage: coverage
+  script:
+    - cd backend
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install pytest pytest-cov
+    - pytest --cov=. --cov-report html --cov-report xml
+  artifacts:
+    paths:
+      - backend/htmlcov/
+      - backend/coverage.xml
+    expire_in: 1h
+  dependencies: [test_backend]
+  needs: [test_backend]
+
+coverage_frontend:
+  image: node:23-alpine
+  allow_failure: true
+  stage: coverage
+  script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+    - npx vitest run --coverage || npx jest --coverage
+  artifacts:
+    paths:
+      - frontend/coverage/
+    expire_in: 1h
+  dependencies: [test_frontend]
+  needs: [test_frontend]
+
+##############################
+# 6. E2E Testing (Playwright)#
+##############################
+e2e_frontend:
+  image: mcr.microsoft.com/playwright:v1.44.0-jammy
+  allow_failure: true
+  stage: test
+  variables:
+    HOME: /root
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+  script:
+    - npx playwright install --with-deps
+    - npx playwright test || echo "E2E test failures"
+  artifacts:
+    when: always
+    paths:
+      - frontend/playwright-report
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 7. Build Images            #
+##############################
+build_backend:
+  image: docker:latest
+  allow_failure: true
+  stage: build
+  services:
+    - docker:dind
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build -t $DOCKER_BACKEND_IMAGE:$CI_COMMIT_SHA ./backend
+    - docker push $DOCKER_BACKEND_IMAGE:$CI_COMMIT_SHA
+  only:
+    - branches
+    - merge_requests
+  artifacts:
+    expire_in: 1h
+
+build_frontend:
+  image: docker:latest
+  allow_failure: true
+  stage: build
+  services:
+    - docker:dind
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build -t $DOCKER_FRONTEND_IMAGE:$CI_COMMIT_SHA .
+    - docker push $DOCKER_FRONTEND_IMAGE:$CI_COMMIT_SHA
+  only:
+    - branches
+    - merge_requests
+  artifacts:
+    expire_in: 1h
+
+##############################
+# 8. Container Scanning      #
+##############################
+scan_backend_image:
+  image: aquasec/trivy:latest
+  allow_failure: true
+  stage: scan
+  script:
+    - trivy image --exit-code 0 --format table --output trivy-backend-report.txt $DOCKER_BACKEND_IMAGE:$CI_COMMIT_SHA
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $DOCKER_BACKEND_IMAGE:$CI_COMMIT_SHA || true
+  dependencies:
+    - build_backend
+  artifacts:
+    paths:
+      - trivy-backend-report.txt
+    expire_in: 1h
+
+scan_frontend_image:
+  image: aquasec/trivy:latest
+  allow_failure: true
+  stage: scan
+  script:
+    - trivy image --exit-code 0 --format table --output trivy-frontend-report.txt $DOCKER_FRONTEND_IMAGE:$CI_COMMIT_SHA
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL $DOCKER_FRONTEND_IMAGE:$CI_COMMIT_SHA || true
+  dependencies:
+    - build_frontend
+  artifacts:
+    paths:
+      - trivy-frontend-report.txt
+    expire_in: 1h
+
+##############################
+# 9. (Optional) Deploy/CD    #
+##############################
+# To enable continuous deployment, uncomment and adapt one of the jobs below:
+# deploy_backend:
+#   stage: deploy
+#   script:
+#     - echo "Deploy backend container/image here or call your infra scripts"
+#   when: manual
+#   only:
+#     - main
+#
+# deploy_frontend:
+#   stage: deploy
+#   script:
+#     - echo "Deploy frontend container/image here or call your infra scripts"
+#   when: manual
+#   only:
+#     - main
+
+##############################
+# 10. SECRETS MANAGMENT      #
+##############################
+# Best practice: manage secrets using GitLab CI/CD's 'CI/CD Variables'
+# In GitLab UI, add project/group/environment variables and use them in jobs as $VAR
+# Never commit secrets/tokens directly in code
+# Docs: https://docs.gitlab.com/ee/ci/variables/
+
+##############################
+# --- Optional: Preview ---
+##############################
+# preview_frontend:
+#   image: node:20-alpine
+#   stage: deploy
+#   script:
+#     - echo "Preview deployment logic here, e.g. deploy to Netlify/Surge/etc"
+#   only:
+#     - merge_requests
+
+##############################
+# 11. Automated Release      #
+##############################
+
+release_frontend:
+  image: node:23-alpine
+  allow_failure: true
+  stage: release
+  script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npx semantic-release
+  only:
+    - main
+  variables:
+    GITLAB_TOKEN: $CI_JOB_TOKEN
+  dependencies:
+    - install_frontend
+
+release_backend:
+  image: node:20-alpine
+  allow_failure: true
+  stage: release
+  script:
+    - if [ -d backend ]; then cd backend; fi
+    - npx semantic-release
+  only:
+    - main
+  variables:
+    GITLAB_TOKEN: $CI_JOB_TOKEN
+  dependencies:
+    - install_backend
+
+# Note:
+# - Requires CI/CD variable `GITLAB_TOKEN` or `GH_TOKEN` with permissions to push to repo/tags.
+# - Configure `semantic-release` in frontend/package.json and backend/package.json or standalone config files for customization.
+
+##############################
+# 12. Dependency Updates     #
+##############################
+
+dependency_updates:
+  image: renovate/renovate:slim
+  allow_failure: true
+  stage: dependency_updates
+  variables:
+    RENOVATE_TOKEN: "$GITLAB_TOKEN"
+  script:
+    # This assumes the Renovate bot is configured as a user/bot with access to the repo.
+    # For public repos, Renovate can run in "worker" mode via CI just using project access.
+    - npx renovate
+#  only:
+    - schedules
+    - main
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+
+# Renovate will look for configuration in renovate.json or package files.
+# Visit https://docs.renovatebot.com/self-hosted-configuration/ for more details.
+
+##############################
+# 13. License Compliance     #
+##############################
+license_compliance_backend:
+  image: 
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  stage: security
+  script:
+    - trivy fs --scanners license --license-full --format table --output trivy-backend-licenses.txt ./logic || true
+  allow_failure: true
+  artifacts:
+    paths:
+      - trivy-backend-licenses.txt
+    expire_in: 30m
+
+license_compliance_frontend:
+  image: 
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  stage: security
+  script:
+    - trivy fs --scanners license --license-full --format table --output trivy-frontend-licenses.txt ./frontend || true
+  allow_failure: true
+  artifacts:
+    paths:
+      - trivy-frontend-licenses.txt
+    expire_in: 30m
+
+##############################
+# 14. Dockerfile Lint        #
+##############################
+lint_dockerfiles:
+  stage: lint
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - find . -name 'Dockerfile*' -exec hadolint --no-fail -f gitlab_codeclimate {} + > docker-lint.json
+  artifacts:
+    name: "$CI_JOB_NAME artifacts from $CI_PROJECT_NAME on $CI_COMMIT_REF_SLUG"
+    when: always
+    reports:
+      codequality:
+        - docker-lint.json
+  interruptible: true
