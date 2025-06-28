@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+# Install required packages
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install SonarQube Scanner
+RUN wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-4.8.0.2856-linux.zip \
+    && unzip sonar-scanner-cli-4.8.0.2856-linux.zip \
+    && mv sonar-scanner-4.8.0.2856-linux /opt/sonar-scanner \
+    && rm sonar-scanner-cli-4.8.0.2856-linux.zip
+
+# Add SonarQube Scanner to PATH
+ENV PATH="/opt/sonar-scanner/bin:${PATH}"
+
+# Set working directory
+WORKDIR /app
+
+# Default command
+CMD ["sonar-scanner"] 

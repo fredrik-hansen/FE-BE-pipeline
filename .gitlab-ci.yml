@@ -1,4 +1,3 @@
-
 stages:
   - install
   - lint
@@ -7,6 +6,7 @@ stages:
   - coverage
   - build
   - scan
+  - sonarqube
   - deploy
   - release
   - dependency_updates
@@ -15,6 +15,8 @@ variables:
   DOCKER_BACKEND_IMAGE: "$CI_REGISTRY_IMAGE/backend"
   DOCKER_FRONTEND_IMAGE: "$CI_REGISTRY_IMAGE/frontend"
   DOCKER_BUILDKIT: 1
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  GIT_DEPTH: "0"
 
 cache:
   paths:
@@ -217,6 +219,21 @@ e2e_frontend:
 ##############################
 # 7. Build Images            #
 ##############################
+build_sonarqube_scanner:
+  image: docker:latest
+  stage: build
+  services:
+    - docker:dind
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build -f Dockerfile.sonarqube-scanner -t $CI_REGISTRY_IMAGE/sonarqube-scanner:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/sonarqube-scanner:$CI_COMMIT_SHA
+  only:
+    - branches
+    - merge_requests
+  artifacts:
+    expire_in: 1h
+
 build_backend:
   image: docker:latest
   allow_failure: true
@@ -281,7 +298,112 @@ scan_frontend_image:
     expire_in: 1h
 
 ##############################
-# 9. (Optional) Deploy/CD    #
+# 9. SonarQube Analysis      #
+##############################
+sonarqube_backend:
+  image: $CI_REGISTRY_IMAGE/sonarqube-scanner:$CI_COMMIT_SHA
+  stage: sonarqube
+  services:
+    - name: sonarqube:community
+      alias: sonarqube
+  variables:
+    SONAR_HOST_URL: "http://sonarqube:9000"
+    SONAR_LOGIN: "admin"
+    SONAR_PASSWORD: "admin"
+  before_script:
+    - cd backend
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install pytest pytest-cov
+    - pytest --cov=. --cov-report xml --cov-report html --junitxml=junit.xml
+  script:
+    - |
+      # Wait for SonarQube to be ready
+      until curl -s "$SONAR_HOST_URL/api/system/status" | grep -q '"status":"UP"'; do
+        echo "Waiting for SonarQube to be ready..."
+        sleep 10
+      done
+    - |
+      # Create sonar-project.properties
+      cat > sonar-project.properties << EOF
+      sonar.projectKey=${CI_PROJECT_PATH_SLUG}-backend
+      sonar.projectName=${CI_PROJECT_NAME} Backend
+      sonar.projectVersion=${CI_COMMIT_SHA}
+      sonar.sources=.
+      sonar.python.version=3.11
+      sonar.python.coverage.reportPaths=coverage.xml
+      sonar.python.xunit.reportPath=junit.xml
+      sonar.host.url=${SONAR_HOST_URL}
+      sonar.login=${SONAR_LOGIN}
+      sonar.password=${SONAR_PASSWORD}
+      sonar.scm.provider=git
+      sonar.scm.revision=${CI_COMMIT_SHA}
+      EOF
+    - sonar-scanner
+  dependencies:
+    - test_backend
+    - coverage_backend
+    - build_sonarqube_scanner
+  artifacts:
+    paths:
+      - backend/.scannerwork/
+      - backend/coverage.xml
+      - backend/junit.xml
+    expire_in: 1h
+  allow_failure: true
+
+sonarqube_frontend:
+  image: node:23-alpine
+  stage: sonarqube
+  services:
+    - name: sonarqube:community
+      alias: sonarqube
+  variables:
+    SONAR_HOST_URL: "http://sonarqube:9000"
+    SONAR_LOGIN: "admin"
+    SONAR_PASSWORD: "admin"
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+    - npm install -g sonarqube-scanner
+    - npx vitest run --coverage || npx jest --coverage
+  script:
+    - |
+      # Wait for SonarQube to be ready
+      until curl -s "$SONAR_HOST_URL/api/system/status" | grep -q '"status":"UP"'; do
+        echo "Waiting for SonarQube to be ready..."
+        sleep 10
+      done
+    - |
+      # Create sonar-project.properties
+      cat > sonar-project.properties << EOF
+      sonar.projectKey=${CI_PROJECT_PATH_SLUG}-frontend
+      sonar.projectName=${CI_PROJECT_NAME} Frontend
+      sonar.projectVersion=${CI_COMMIT_SHA}
+      sonar.sources=src
+      sonar.tests=src
+      sonar.javascript.lcov.reportPaths=coverage/lcov.info
+      sonar.testExecutionReportPaths=coverage/test-report.xml
+      sonar.host.url=${SONAR_HOST_URL}
+      sonar.login=${SONAR_LOGIN}
+      sonar.password=${SONAR_PASSWORD}
+      sonar.scm.provider=git
+      sonar.scm.revision=${CI_COMMIT_SHA}
+      EOF
+    - sonar-scanner
+  dependencies:
+    - test_frontend
+    - coverage_frontend
+  artifacts:
+    paths:
+      - frontend/.scannerwork/
+      - frontend/coverage/
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 10. (Optional) Deploy/CD    #
 ##############################
 # To enable continuous deployment, uncomment and adapt one of the jobs below:
 # deploy_backend:
@@ -299,25 +421,6 @@ scan_frontend_image:
 #   when: manual
 #   only:
 #     - main
-
-##############################
-# 10. SECRETS MANAGMENT      #
-##############################
-# Best practice: manage secrets using GitLab CI/CD's 'CI/CD Variables'
-# In GitLab UI, add project/group/environment variables and use them in jobs as $VAR
-# Never commit secrets/tokens directly in code
-# Docs: https://docs.gitlab.com/ee/ci/variables/
-
-##############################
-# --- Optional: Preview ---
-##############################
-# preview_frontend:
-#   image: node:20-alpine
-#   stage: deploy
-#   script:
-#     - echo "Preview deployment logic here, e.g. deploy to Netlify/Surge/etc"
-#   only:
-#     - merge_requests
 
 ##############################
 # 11. Automated Release      #
@@ -424,3 +527,26 @@ lint_dockerfiles:
       codequality:
         - docker-lint.json
   interruptible: true
+
+##############################
+# 11. SECRETS MANAGMENT      #
+##############################
+# Best practice: manage secrets using GitLab CI/CD's 'CI/CD Variables'
+# In GitLab UI, add project/group/environment variables and use them in jobs as $VAR
+# Never commit secrets/tokens directly in code
+# Docs: https://docs.gitlab.com/ee/ci/variables/
+
+##############################
+# --- Optional: Preview ---
+##############################
+# preview_frontend:
+#   image: node:20-alpine
+#   stage: deploy
+#   script:
+#     - echo "Preview deployment logic here, e.g. deploy to Netlify/Surge/etc"
+#   only:
+#     - merge_requests
+
+##############################
+# 12. Automated Release      #
+##############################
