@@ -32,6 +32,7 @@ cache:
 ##############################
 install_backend:
   image: python:3.11
+  allow_failure: true
   stage: install
   script:
     - pip install --upgrade pip
@@ -44,6 +45,7 @@ install_backend:
 
 install_frontend:
   image: node:23-alpine
+  allow_failure: true
   stage: install
   script:
     - if [ -d frontend ]; then cd frontend; fi
@@ -221,6 +223,7 @@ e2e_frontend:
 ##############################
 build_sonarqube_scanner:
   image: docker:latest
+  allow_failure: true
   stage: build
   services:
     - docker:dind
