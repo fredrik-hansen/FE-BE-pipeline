@@ -7,6 +7,16 @@ stages:
   - build
   - scan
   - sonarqube
+  - performance
+  - api_testing
+  - accessibility
+  - visual_regression
+  - documentation
+  - compliance
+  - chaos_engineering
+  - monitoring
+  - backup_testing
+  - multi_environment
   - deploy
   - release
   - dependency_updates
@@ -406,7 +416,408 @@ sonarqube_frontend:
   allow_failure: true
 
 ##############################
-# 10. (Optional) Deploy/CD    #
+# 10. Performance Testing    #
+##############################
+performance_backend:
+  image: k6io/k6:latest
+  stage: performance
+  variables:
+    K6_BROWSER_ENABLED: "true"
+  script:
+    - |
+      cat > load-test.js << EOF
+      import http from 'k6/http';
+      import { check, sleep } from 'k6';
+      
+      export const options = {
+        stages: [
+          { duration: '30s', target: 10 },
+          { duration: '1m', target: 10 },
+          { duration: '30s', target: 0 },
+        ],
+        thresholds: {
+          http_req_duration: ['p(95)<500'],
+          http_req_failed: ['rate<0.1'],
+        },
+      };
+      
+      export default function () {
+        const response = http.get('http://your-backend-url/health');
+        check(response, {
+          'status is 200': (r) => r.status === 200,
+          'response time < 500ms': (r) => r.timings.duration < 500,
+        });
+        sleep(1);
+      }
+      EOF
+    - k6 run load-test.js
+  dependencies:
+    - build_backend
+  artifacts:
+    paths:
+      - k6-results.json
+    expire_in: 1h
+  allow_failure: true
+  only:
+    - main
+    - merge_requests
+
+performance_frontend:
+  image: node:23-alpine
+  stage: performance
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+    - npm install -g lighthouse
+  script:
+    - |
+      # Build the frontend for testing
+      npm run build
+    - |
+      # Run Lighthouse performance audit
+      lighthouse http://localhost:3000 --output=json --output-path=./lighthouse-report.json --chrome-flags="--headless --no-sandbox" || true
+    - |
+      # Run bundle analyzer
+      npm install -g webpack-bundle-analyzer
+      npx webpack-bundle-analyzer build/static/js/*.js --report --mode static || true
+  dependencies:
+    - build_frontend
+  artifacts:
+    paths:
+      - frontend/lighthouse-report.json
+      - frontend/bundle-analysis.html
+    expire_in: 1h
+  allow_failure: true
+  only:
+    - main
+    - merge_requests
+
+##############################
+# 11. API Testing            #
+##############################
+api_testing:
+  image: postman/newman:alpine
+  stage: api_testing
+  script:
+    - |
+      # Export Postman collection to JSON format
+      # You can store your Postman collection in the repo or use a URL
+      if [ -f "postman/collection.json" ]; then
+        newman run postman/collection.json \
+          --reporters cli,json \
+          --reporter-json-export newman-report.json \
+          --environment postman/environment.json || true
+      fi
+  artifacts:
+    paths:
+      - newman-report.json
+    expire_in: 1h
+  allow_failure: true
+  dependencies:
+    - build_backend
+
+##############################
+# 12. Database Migration Testing #
+##############################
+db_migration_test:
+  image: postgres:15-alpine
+  stage: test
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_password
+  script:
+    - |
+      # Wait for database to be ready
+      until pg_isready -h postgres -U test_user -d test_db; do
+        echo "Waiting for database..."
+        sleep 2
+      done
+    - |
+      # Run database migrations
+      cd backend
+      pip install -r requirements.txt
+      python manage.py migrate --run-syncdb || true
+      python manage.py test --keepdb || true
+  artifacts:
+    paths:
+      - backend/db-test-results/
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 13. Accessibility Testing  #
+##############################
+accessibility_test:
+  image: node:23-alpine
+  stage: accessibility
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+    - npm install -g axe-core puppeteer
+  script:
+    - |
+      # Run accessibility tests
+      node << EOF
+      const puppeteer = require('puppeteer');
+      const axe = require('axe-core');
+      
+      (async () => {
+        const browser = await puppeteer.launch();
+        const page = await browser.newPage();
+        await page.goto('http://localhost:3000');
+        
+        const results = await page.evaluate(axe.run);
+        console.log(JSON.stringify(results, null, 2));
+        
+        await browser.close();
+      })();
+      EOF
+  dependencies:
+    - build_frontend
+  artifacts:
+    paths:
+      - frontend/accessibility-report.json
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 14. Visual Regression Testing #
+##############################
+visual_regression:
+  image: node:23-alpine
+  stage: visual_regression
+  before_script:
+    - if [ -d frontend ]; then cd frontend; fi
+    - npm i
+    - npm ci
+    - npm install -g backstopjs
+  script:
+    - |
+      # Initialize BackstopJS
+      npx backstop init
+    - |
+      # Run visual regression tests
+      npx backstop test --config=backstop.json || true
+  dependencies:
+    - build_frontend
+  artifacts:
+    paths:
+      - frontend/backstop_data/
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 15. Documentation Generation #
+##############################
+generate_docs:
+  image: node:23-alpine
+  stage: documentation
+  before_script:
+    - npm install -g jsdoc typedoc
+  script:
+    - |
+      # Generate API documentation
+      if [ -d backend ]; then
+        cd backend
+        pip install sphinx sphinx-rtd-theme
+        sphinx-quickstart -q -p "Backend API" -a "Your Team" -v 1.0 -r 1.0 -l en -n docs
+        make html
+      fi
+    - |
+      # Generate frontend documentation
+      if [ -d frontend ]; then
+        cd frontend
+        npx typedoc --out docs src/
+        npx jsdoc -c jsdoc.json src/
+      fi
+  artifacts:
+    paths:
+      - backend/docs/_build/html/
+      - frontend/docs/
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 16. Compliance & Governance #
+##############################
+compliance_check:
+  image: openpolicyagent/opa:latest
+  stage: compliance
+  script:
+    - |
+      # Run OPA compliance checks
+      opa eval --data policies/ --input data/ "data.compliance.violations" || true
+  artifacts:
+    paths:
+      - compliance-report.json
+    expire_in: 30m
+  allow_failure: true
+
+##############################
+# 17. Chaos Engineering      #
+##############################
+chaos_testing:
+  image: chaos-mesh/chaos-mesh:latest
+  stage: chaos_engineering
+  script:
+    - |
+      # Run chaos engineering tests
+      # This requires Chaos Mesh to be installed in your cluster
+      kubectl apply -f chaos-experiments/ || true
+  dependencies:
+    - build_backend
+    - build_frontend
+  artifacts:
+    paths:
+      - chaos-results/
+    expire_in: 1h
+  allow_failure: true
+  only:
+    - main
+
+##############################
+# 18. Monitoring & Observability #
+##############################
+monitoring_setup:
+  image: prom/prometheus:latest
+  stage: monitoring
+  script:
+    - |
+      # Setup monitoring configuration
+      echo "Setting up monitoring..."
+  dependencies:
+    - build_backend
+    - build_frontend
+  artifacts:
+    paths:
+      - monitoring-config/
+    expire_in: 1h
+  allow_failure: true
+  only:
+    - main
+
+##############################
+# 19. Backup & Recovery Testing #
+##############################
+backup_test:
+  image: postgres:15-alpine
+  stage: backup_testing
+  script:
+    - |
+      # Test backup and recovery procedures
+      pg_dump -h postgres -U test_user test_db > backup.sql
+      pg_restore -h postgres -U test_user -d test_db backup.sql || true
+  dependencies:
+    - db_migration_test
+  artifacts:
+    paths:
+      - backup.sql
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 20. Multi-Environment Testing #
+##############################
+staging_deploy:
+  image: docker:latest
+  stage: multi_environment
+  services:
+    - docker:dind
+  script:
+    - |
+      # Deploy to staging environment
+      echo "Deploying to staging..."
+      # Add your staging deployment logic here
+  environment:
+    name: staging
+    url: https://staging.yourapp.com
+  dependencies:
+    - build_backend
+    - build_frontend
+  only:
+    - main
+  when: manual
+  allow_failure: true
+
+staging_test:
+  image: mcr.microsoft.com/playwright:v1.44.0-jammy
+  stage: multi_environment
+  script:
+    - |
+      # Run tests against staging environment
+      npx playwright test --config=playwright.staging.config.js
+  dependencies:
+    - staging_deploy
+  environment:
+    name: staging
+  only:
+    - main
+  allow_failure: true
+
+##############################
+# 21. Enhanced Security Scanning #
+##############################
+secret_scanning:
+  image: trufflesecurity/trufflehog:latest
+  stage: security
+  script:
+    - trufflehog --json . > secrets-report.json
+  artifacts:
+    paths:
+      - secrets-report.json
+    expire_in: 30m
+  allow_failure: true
+
+dependency_check:
+  image: owasp/dependency-check:latest
+  stage: security
+  script:
+    - dependency-check --scan . --format JSON --out reports/
+  artifacts:
+    paths:
+      - reports/
+    expire_in: 30m
+  allow_failure: true
+
+##############################
+# 22. Infrastructure as Code Testing #
+##############################
+terraform_validate:
+  image: hashicorp/terraform:latest
+  stage: test
+  script:
+    - terraform init
+    - terraform validate
+    - terraform plan
+  artifacts:
+    paths:
+      - terraform-plan.out
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 23. Cost Optimization      #
+##############################
+cost_analysis:
+  image: node:23-alpine
+  stage: build
+  script:
+    - npm install -g @snyk/cost-of-libraries
+    - npx cost-of-libraries
+  artifacts:
+    paths:
+      - cost-report.json
+    expire_in: 1h
+  allow_failure: true
+
+##############################
+# 24. (Optional) Deploy/CD    #
 ##############################
 # To enable continuous deployment, uncomment and adapt one of the jobs below:
 # deploy_backend:
