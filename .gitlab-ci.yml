@@ -226,7 +226,6 @@ e2e_frontend:
     paths:
       - frontend/playwright-report
     expire_in: 1h
-  allow_failure: true
 
 ##############################
 # 7. Build Images            #
@@ -835,6 +834,41 @@ cost_analysis:
 #   when: manual
 #   only:
 #     - main
+deploy_frontend:
+  image: ubuntu:latest
+  allow_failure: true
+  stage: deploy
+  only: 
+    - pilot
+  before_script:
+    - apt-get -yq update
+    - apt-get -yqq install ssh
+    - install -m 600 -D /dev/null ~/.ssh/id_rsa
+    - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+    - ssh-keyscan -H $SSH_HOST > ~/.ssh/known_hosts
+  script:
+    - ssh $SSH_USER@$SSH_HOST "cd $WORK_DIR && pwd && docker system prune -f && docker-compose pull && docker-compose up -d && docker-compose ps && exit"
+   
+  after_script:
+    - rm -rf ~/.ssh
+  
+deploy_backend:
+  image: ubuntu:latest
+  allow_failure: true
+  stage: deploy
+  only: 
+    - pilot
+  before_script:
+    - apt-get -yq update
+    - apt-get -yqq install ssh
+    - install -m 600 -D /dev/null ~/.ssh/id_rsa
+    - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+    - ssh-keyscan -H $SSH_HOST > ~/.ssh/known_hosts
+  script:
+    - ssh $SSH_USER@$SSH_HOST "cd $WORK_DIR && pwd && docker system prune -f && docker-compose pull && docker-compose up -d && docker-compose ps && exit"
+   
+  after_script:
+    - rm -rf ~/.ssh
 
 ##############################
 # 11. Automated Release      #
@@ -889,7 +923,7 @@ dependency_updates:
 #  only:
     - schedules
     - main
-  allow_failure: true
+ 
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: always
@@ -942,6 +976,59 @@ lint_dockerfiles:
         - docker-lint.json
   interruptible: true
 
+Syft:
+  stage: scan
+  allow_failure: true
+  image:
+    name: nixos/nix:latest
+    entrypoint: [""]
+  variables:
+    DOCKER_IMAGE: $DOCKER_IMAGE_NAME
+    DOCKER_IMAGE_NAME: $CI_REGISTRY_IMAGE:frontend-$CI_COMMIT_REF_SLUG
+    # Setting up the registry credentials
+    SYFT_REGISTRY_AUTH_USERNAME: ${CI_REGISTRY_USER}
+    SYFT_REGISTRY_AUTH_PASSWORD: ${CI_REGISTRY_PASSWORD}
+#  before_script:
+#    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - nix-shell -p syft --run "syft scan registry.gitlab.com/liv.ad/knowledge-nexus_v3.1:frontend-pilot --output cyclonedx-json=sbom.json"
+  artifacts:
+    paths:
+      - sbom.json
+    when: on_success
+    expire_in: "30 days"
+  only:
+    refs:
+      - main
+
+Grype:
+  stage: scan
+  allow_failure: true #Yes, I am sloppy for now.
+  image:
+    name: nixos/nix:latest
+    entrypoint: [""]
+  needs:
+    - job: Syft
+      artifacts: true
+  script:
+    - nix-shell -p grype --run 'grype --fail-on Critical sbom:sbom.json'
+  only:
+    refs:
+      - main
+
+pages:
+  image: node:23-alpine
+  stage: deploy
+  allow_failure: true
+  script:
+  - npm install -g redoc-cli
+  - mkdir -p public
+  - redoc-cli bundle documentation/openapi.json -o public/index.html
+  artifacts:
+    paths:
+    - public
+  only:
+  - main
 ##############################
 # 11. SECRETS MANAGMENT      #
 ##############################
